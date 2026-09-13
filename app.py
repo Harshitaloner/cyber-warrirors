@@ -235,3 +235,4 @@ def generate_default_analysis_mockup() -> dict:
             "ERROR: IKE Notify NO_PROPOSAL_CHOSEN - Encryption algorithm mismatch",
             "WARNING: Weak DH Group detected (GROUP2-1024) - Upgrade to GROUP14+",
             ]
+    }
