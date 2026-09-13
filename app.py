@@ -1,238 +1,275 @@
-#!/usr/bin/env python3
 """
 IPsec VPN Protocol Analyser & Security Forensics Framework
-Smart India Hackathon (SIH) Complete Consolidated Monolithic Deliverable
-Streamlit Native Edition - Optimized for Streamlit Cloud Deployments.
+Hackathon MVP -- Streamlit front-end.
+
+Run with:  streamlit run app.py
 """
-
 import os
-import struct
-import logging
 import tempfile
-from enum import Enum
-from datetime import datetime
-from dataclasses import dataclass
-from typing import Iterator, Dict, List, Optional
-
-# Core UI Framework
+import pandas as pd
 import streamlit as st
 
-# ReportLab Layout & Flow Engine Components
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
-from reportlab.lib.enums import TA_CENTER
+from core.pcap_reader import read_pcap, PcapParseError, linktype_name
+from core.packet_dissector import parse_packet
+from core.ike_dissector import parse_isakmp
+from core.state_engine import build_sessions, analyse_esp
+from core.crypto_audit import audit_messages, score_posture
+from core.diagnostics import explain_session
+from core.report_generator import build_pdf_report
+from core.sample_pcap_generator import generate_sample_pcap
 
-# Initialize Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("IPsecStreamlitEngine")
+st.set_page_config(
+    page_title="IPsec VPN Protocol Analyser",
+    page_icon="🛡️",
+    layout="wide",
+)
 
-# =====================================================================
-# 1. ENUMS, CONSTANTS & DATASTRUCTURES
-# =====================================================================
+# ---------------------------------------------------------------- styling --
+st.markdown("""
+<style>
+.big-metric { font-size: 2rem; font-weight: 700; }
+.grade-A { color: #16A34A; } .grade-B { color: #CA8A04; }
+.grade-C { color: #EA580C; } .grade-D { color: #DC2626; }
+.finding-critical { border-left: 4px solid #DC2626; padding: 8px 12px; margin-bottom: 8px; background: #FEF2F2; border-radius: 4px;}
+.finding-warning  { border-left: 4px solid #D97706; padding: 8px 12px; margin-bottom: 8px; background: #FFFBEB; border-radius: 4px;}
+.session-ok  { border-left: 4px solid #16A34A; padding: 10px 14px; margin-bottom: 10px; background: #F0FDF4; border-radius: 4px;}
+.session-bad { border-left: 4px solid #DC2626; padding: 10px 14px; margin-bottom: 10px; background: #FEF2F2; border-radius: 4px;}
+</style>
+""", unsafe_allow_html=True)
 
-PCAP_GLOBAL_HEADER_LENGTH = 24
-PCAP_PACKET_HEADER_LENGTH = 16
-MAGIC_NUMBER_NATIVE = 0xa1b2c3d4
-MAGIC_NUMBER_SWAPPED = 0xd4c3b2a1
+st.title("🛡️ IPsec VPN Protocol Analyser")
+st.caption("Cyber Security & Network Forensics · IKEv1/IKEv2 handshake dissection, "
+           "cryptographic audit, and ESP anti-replay analysis -- from a raw PCAP.")
 
-IP_PROTOCOL_IKE = 50   
-IP_PROTOCOL_AH = 51    
-UDP_PORT_IKE = 500     
-UDP_PORT_NAT_T = 4500  
 
-@dataclass
-class PacketInfo:
-    timestamp: float
-    packet_length: int
-    captured_length: int
-    src_ip: str
-    dst_ip: str
-    protocol: str  
-    src_port: Optional[int] = None
-    dst_port: Optional[int] = None
-    payload: bytes = b""
+# ---------------------------------------------------------------- sidebar --
+with st.sidebar:
+    st.header("Input")
+    source = st.radio("Choose a data source", ["Use bundled sample capture", "Upload a .pcap file"])
 
-# =====================================================================
-# 2. BINARY PCAP INGESTION FRAMEWORK
-# =====================================================================
+    uploaded_path = None
+    label = "ipsec_demo.pcap (sample)"
+    if source == "Upload a .pcap file":
+        up = st.file_uploader("Classic .pcap (not .pcapng)", type=["pcap"])
+        if up is not None:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pcap")
+            tmp.write(up.getvalue())
+            tmp.close()
+            uploaded_path = tmp.name
+            label = up.name
+    else:
+        sample_path = os.path.join("sample_captures", "ipsec_demo.pcap")
+        if not os.path.exists(sample_path):
+            generate_sample_pcap(sample_path)
+        uploaded_path = sample_path
 
-class MonolithicPCAPReader:
-    def __init__(self, pcap_file: str):
-        self.pcap_file = pcap_file
-        self.is_native = True
-        self.packets_count = 0
-    
-    def _read_global_header(self, data: bytes) -> bool:
-        if len(data) < PCAP_GLOBAL_HEADER_LENGTH:
-            return False
-        magic = struct.unpack('<I', data[0:4])[0]
-        if magic == MAGIC_NUMBER_NATIVE:
-            self.is_native = True
-        elif magic == MAGIC_NUMBER_SWAPPED:
-            self.is_native = False
-        else:
-            return False
-        return True
-    
-    def _parse_ipv4_header(self, packet_data: bytes) -> Optional[Dict]:
-        if len(packet_data) < 20:
-            return None
-        version_ihl = packet_data[0]
-        ihl = (version_ihl & 0x0f) * 4
-        if ihl < 20 or len(packet_data) < ihl:
-            return None
-        protocol = packet_data[9]
-        src_ip = ".".join(map(str, packet_data[12:16]))
-        dst_ip = ".".join(map(str, packet_data[16:20]))
-        return {
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "protocol": protocol,
-            "ihl": ihl,
-            "payload": packet_data[ihl:]
-        }
-    
-    def _parse_udp_header(self, payload: bytes) -> Optional[Dict]:
-        if len(payload) < 8:
-            return None
-        src_port = struct.unpack('>H', payload[0:2])[0]
-        dst_port = struct.unpack('>H', payload[2:4])[0]
-        return {
-            "src_port": src_port,
-            "dst_port": dst_port,
-            "payload": payload[8:]
-        }
-    
-    def read_packets(self) -> Iterator[PacketInfo]:
-        if not os.path.exists(self.pcap_file):
-            return
-        try:
-            with open(self.pcap_file, 'rb') as f:
-                global_header = f.read(PCAP_GLOBAL_HEADER_LENGTH)
-                if not self._read_global_header(global_header):
-                    return
-                
-                while True:
-                    packet_header = f.read(PCAP_PACKET_HEADER_LENGTH)
-                    if len(packet_header) < PCAP_PACKET_HEADER_LENGTH:
-                        break
-                    
-                    if self.is_native:
-                        ts_sec, ts_usec, incl_len, orig_len = struct.unpack('<IIII', packet_header)
-                    else:
-                        ts_sec, ts_usec, incl_len, orig_len = struct.unpack('>IIII', packet_header)
-                        
-                    timestamp = ts_sec + (ts_usec / 1000000.0)
-                    packet_data = f.read(incl_len)
-                    
-                    if len(packet_data) < 14:
-                        continue
-                    
-                    eth_type = struct.unpack('>H', packet_data[12:14])[0]
-                    if eth_type != 0x0800:  
-                        continue
-                    
-                    ipv4_info = self._parse_ipv4_header(packet_data[14:])
-                    if not ipv4_info:
-                        continue
-                        
-                    proto = ipv4_info['protocol']
-                    payload = ipv4_info['payload']
-                    
-                    if proto == IP_PROTOCOL_IKE:
-                        self.packets_count += 1
-                        yield PacketInfo(timestamp, orig_len, incl_len, ipv4_info['src_ip'], ipv4_info['dst_ip'], "ESP", payload=payload)
-                    elif proto == IP_PROTOCOL_AH:
-                        self.packets_count += 1
-                        yield PacketInfo(timestamp, orig_len, incl_len, ipv4_info['src_ip'], ipv4_info['dst_ip'], "AH", payload=payload)
-                    elif proto == 17:  
-                        udp_info = self._parse_udp_header(payload)
-                        if not udp_info:
-                            continue
-                        if udp_info['src_port'] in [UDP_PORT_IKE, UDP_PORT_NAT_T] or udp_info['dst_port'] in [UDP_PORT_IKE, UDP_PORT_NAT_T]:
-                            self.packets_count += 1
-                            yield PacketInfo(
-                                timestamp, orig_len, incl_len, ipv4_info['src_ip'], ipv4_info['dst_ip'], "IKE",
-                                src_port=udp_info['src_port'], dst_port=udp_info['dst_port'], payload=udp_info['payload']
-                            )
-        except Exception as e:
-            logger.error(f"Error parsing raw byte buffer streams: {str(e)}")
+    st.markdown("---")
+    st.caption(
+        "The bundled sample contains a weak-cipher IKEv1 tunnel, a rejected "
+        "negotiation (NO_PROPOSAL_CHOSEN), a strong IKEv2 tunnel, and an ESP "
+        "flow with an out-of-order and a gapped sequence number -- so every "
+        "part of the analyser has something to show."
+    )
+    st.markdown("---")
+    st.caption("Phase 1 MVP -- offline PCAP dissection only. Live capture, "
+               "key-assisted ESP decryption, and SIEM export are on the roadmap.")
 
-# =====================================================================
-# 3. ANALYSIS METHODOLOGY ENGINE
-# =====================================================================
 
-class MonolithicIPsecAnalyzer:
-    def __init__(self, pcap_path: str):
-        self.pcap_path = pcap_path
-        self.results = {
-            "summary": {"total_handshakes": 0, "successful_tunnels": 0, "failed_handshakes": [], "esp_flows": 0},
-            "handshakes": {},
-            "diagnostics": []
-        }
+if not uploaded_path:
+    st.info("Upload a .pcap file or use the bundled sample from the sidebar to begin.")
+    st.stop()
 
-    def execute_analysis(self) -> dict:
-        packets = list(MonolithicPCAPReader(self.pcap_path).read_packets())
-        if not packets:
-            return generate_default_analysis_mockup()
-            
-        handshake_idx = 1
-        for pkt in packets:
-            if pkt.protocol in ["ESP", "AH"]:
-                self.results["summary"]["esp_flows"] += 1
-            elif pkt.protocol == "IKE":
-                session_key = f"{pkt.src_ip}_{pkt.dst_ip}"
-                reverse_key = f"{pkt.dst_ip}_{pkt.src_ip}"
-                
-                matched_key = None
-                for verified_key in self.results["handshakes"]:
-                    if verified_key == session_key or verified_key == reverse_key:
-                        matched_key = verified_key
-                        break
-                        
-                if not matched_key:
-                    matched_key = f"handshake_{str(handshake_idx).zfill(3)}"
-                    self.results["handshakes"][matched_key] = {
-                        "initiator": pkt.src_ip,
-                        "responder": pkt.dst_ip,
-                        "version": "IKEv2" if (len(pkt.payload) > 16 and pkt.payload[17] == 0x20) else "IKEv1",
-                        "packets_count": 0,
-                        "status": "ESTABLISHED"
-                    }
-                    handshake_idx += 1
-                    
-                self.results["handshakes"][matched_key]["packets_count"] += 1
 
-        self.results["summary"]["total_handshakes"] = len(self.results["handshakes"])
-        self.results["summary"]["successful_tunnels"] = len(
-            [h for h in self.results["handshakes"].values() if h["status"] == "ESTABLISHED"]
+# ---------------------------------------------------------------- pipeline --
+@st.cache_data(show_spinner=False)
+def run_pipeline(path: str, mtime: float):
+    packets, linktype = read_pcap(path)
+    dissected = [parse_packet(p.index, p.timestamp, p.data, linktype) for p in packets]
+    dissected = [d for d in dissected if d]
+
+    isakmp_msgs = []
+    for d in dissected:
+        if d.kind == "isakmp":
+            m = parse_isakmp(d.index, d.timestamp, d.src_ip, d.dst_ip,
+                              d.src_port, d.dst_port, d.payload)
+            if m:
+                isakmp_msgs.append(m)
+
+    sessions = build_sessions(isakmp_msgs)
+    findings = audit_messages(isakmp_msgs)
+    score = score_posture(findings)
+    esp_flows = analyse_esp(dissected)
+    return dict(
+        linktype=linktype, dissected=dissected, isakmp_msgs=isakmp_msgs,
+        sessions=sessions, findings=findings, score=score, esp_flows=esp_flows,
+    )
+
+
+try:
+    result = run_pipeline(uploaded_path, os.path.getmtime(uploaded_path))
+except PcapParseError as e:
+    st.error(str(e))
+    st.stop()
+except Exception as e:
+    st.error(f"Could not parse this capture: {e}")
+    st.stop()
+
+dissected = result["dissected"]
+isakmp_msgs = result["isakmp_msgs"]
+sessions = result["sessions"]
+findings = result["findings"]
+score = result["score"]
+esp_flows = result["esp_flows"]
+
+grade_letter = score["grade"][0]
+
+# ---------------------------------------------------------------- overview --
+tabs = st.tabs([
+    "📊 Overview", "🔄 Handshake Timeline", "🔐 Crypto Audit",
+    "🩺 Diagnostics", "📡 ESP / Anti-Replay", "🧾 Packets", "📄 Report",
+])
+
+with tabs[0]:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Packets analysed", len(dissected))
+    c2.metric("ISAKMP messages", len(isakmp_msgs))
+    c3.metric("Tunnel sessions", len(sessions))
+    established = sum(1 for s in sessions if s.established)
+    c4.metric("Established / Failed", f"{established} / {len(sessions) - established}")
+
+    st.markdown("### Cryptographic Posture")
+    cc1, cc2 = st.columns([1, 3])
+    with cc1:
+        st.markdown(
+            f'<div class="big-metric grade-{grade_letter}">{score["grade"]}</div>',
+            unsafe_allow_html=True,
         )
-        
-        self._evaluate_diagnostics()
-        return self.results
+        st.progress(score["score"] / 100)
+        st.caption(f'Score: {score["score"]}/100')
+    with cc2:
+        st.metric("Critical findings", score["critical"])
+        st.metric("Warning findings", score["warning"])
 
-    def _evaluate_diagnostics(self):
-        for hs_id, hs_data in self.results["handshakes"].items():
-            if hs_data["version"] == "IKEv1":
-                self.results["diagnostics"].append("WARNING: IKEv1 Aggressive Mode detected - Vulnerable to PSK brute-force")
-                self.results["summary"]["failed_handshakes"].append(hs_id)
-                hs_data["status"] = "FAILED"
-        if not self.results["diagnostics"]:
-            self.results["diagnostics"].append("INFO: ESP sequence counter validated - No packet loss detected")
+    st.markdown("### Link layer")
+    st.caption(f"Detected link type: {linktype_name(result['linktype'])}")
 
-def generate_default_analysis_mockup() -> dict:
-    return {
-        "summary": {"total_handshakes": 3, "successful_tunnels": 2, "failed_handshakes": ["handshake_003"], "esp_flows": 2},
-        "handshakes": {
-            "handshake_001": {"initiator": "192.168.1.10", "responder": "192.168.1.1", "version": "IKEv2", "packets_count": 8, "status": "ESTABLISHED"},
-            "handshake_002": {"initiator": "10.0.0.5", "responder": "10.0.0.1", "version": "IKEv2", "packets_count": 6, "status": "ESTABLISHED"},
-            "handshake_003": {"initiator": "172.16.0.10", "responder": "172.16.0.1", "version": "IKEv1", "packets_count": 3, "status": "FAILED"}
-        },
-        "diagnostics": [
-            "ERROR: IKE Notify NO_PROPOSAL_CHOSEN - Encryption algorithm mismatch",
-            "WARNING: Weak DH Group detected (GROUP2-1024) - Upgrade to GROUP14+",
-            ]
-    }
+with tabs[1]:
+    st.subheader("IKE Handshake Timeline")
+    if not sessions:
+        st.info("No ISAKMP (UDP 500/4500) traffic found in this capture.")
+    for s in sessions:
+        badge = "✅ Established" if s.established else "❌ Failed / Incomplete"
+        css = "session-ok" if s.established else "session-bad"
+        st.markdown(
+            f'<div class="{css}"><b>{s.ike_version}</b> tunnel &nbsp;'
+            f'<code>{s.peer_a}</code> ⇄ <code>{s.peer_b}</code> &nbsp;— {badge}</div>',
+            unsafe_allow_html=True,
+        )
+        rows = []
+        for m in s.messages:
+            direction = f"{m.src_ip} → {m.dst_ip}"
+            algo_summary = "; ".join(t.algorithm for t in m.transforms) if m.transforms else (
+                "(encrypted)" if m.is_encrypted else "")
+            notify_summary = ", ".join(n.message_name for n in m.notifies)
+            rows.append({
+                "Packet #": m.packet_index,
+                "Direction": direction,
+                "Exchange": m.exchange_name,
+                "Msg ID": m.message_id,
+                "Proposals / Algorithms": algo_summary,
+                "Notify": notify_summary,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        with st.expander("Root-cause explanation"):
+            for line in explain_session(s):
+                st.write("•", line)
+        st.markdown("")
+
+with tabs[2]:
+    st.subheader("Cryptographic Proposal Audit")
+    if not findings:
+        st.success("No weak algorithms or negotiation errors detected.")
+    else:
+        for f in findings:
+            css = "finding-critical" if f.severity == "critical" else "finding-warning"
+            st.markdown(
+                f'<div class="{css}"><b>[{f.severity.upper()}] {f.title}</b> '
+                f'<i>(packet #{f.source_packet})</i><br>{f.detail}</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("### All negotiated transforms")
+    tf_rows = []
+    for m in isakmp_msgs:
+        for t in m.transforms:
+            tf_rows.append({
+                "Packet #": m.packet_index, "IKE": f"v{m.version_major}",
+                "Exchange": m.exchange_name, "Proposal/Type": t.proto_or_type,
+                "Algorithm": t.algorithm,
+            })
+    if tf_rows:
+        st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No cleartext SA/Proposal payloads found (traffic may be fully encrypted).")
+
+with tabs[3]:
+    st.subheader("Failure Diagnostics")
+    failed = [s for s in sessions if not s.established]
+    if not failed:
+        st.success("Every tunnel in this capture negotiated successfully.")
+    for s in failed:
+        st.markdown(f"**{s.ike_version} tunnel** `{s.peer_a}` ⇄ `{s.peer_b}`")
+        for line in explain_session(s):
+            st.warning(line)
+
+with tabs[4]:
+    st.subheader("ESP Flow Health / Anti-Replay Analysis")
+    if not esp_flows:
+        st.info("No ESP (IP protocol 50) traffic found in this capture.")
+    else:
+        esp_rows = []
+        for spi, fl in esp_flows.items():
+            esp_rows.append({
+                "SPI": spi, "Packets": fl.packets_seen,
+                "Out-of-order": fl.out_of_order, "Gaps detected": fl.gaps_detected,
+                "Max gap size": fl.max_gap, "Replay suspects": fl.replay_suspects,
+            })
+        st.dataframe(pd.DataFrame(esp_rows), use_container_width=True, hide_index=True)
+        for spi, fl in esp_flows.items():
+            if fl.gaps_detected or fl.out_of_order or fl.replay_suspects:
+                st.warning(
+                    f"SPI `{spi}`: {fl.gaps_detected} sequence gap(s) (max {fl.max_gap} "
+                    f"packet(s) missing), {fl.out_of_order} out-of-order packet(s), "
+                    f"{fl.replay_suspects} possible replay(s)."
+                )
+            else:
+                st.success(f"SPI `{spi}`: clean sequence, no loss/replay detected.")
+
+with tabs[5]:
+    st.subheader("Raw Packet Inventory")
+    prows = []
+    for d in dissected:
+        prows.append({
+            "Index": d.index, "Time": round(d.timestamp, 3), "Src": d.src_ip,
+            "Dst": d.dst_ip, "SrcPort": d.src_port, "DstPort": d.dst_port,
+            "IP Proto": d.ip_proto, "Kind": d.kind, "Bytes": d.length,
+        })
+    st.dataframe(pd.DataFrame(prows), use_container_width=True, hide_index=True)
+
+with tabs[6]:
+    st.subheader("Audit Report")
+    st.write("Generate a PDF summarising tunnel sessions, cryptographic findings, "
+             "and ESP flow health -- suitable for attaching to an incident ticket "
+             "or compliance review.")
+    pdf_bytes = build_pdf_report(sessions, findings, score, esp_flows, source_name=label)
+    st.download_button(
+        "⬇️ Download PDF report", data=pdf_bytes,
+        file_name="ipsec_audit_report.pdf", mime="application/pdf",
+    )
+
+st.markdown("---")
+st.caption(
+    "IPsec VPN Protocol Analyser — hackathon MVP prototype. Pure-Python "
+    "PCAP/ISAKMP dissection, no scapy/pyshark/tshark dependency required."
+)

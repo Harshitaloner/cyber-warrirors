@@ -1,0 +1,113 @@
+"""
+report_generator.py
+Builds a downloadable PDF audit report summarising sessions, findings,
+and ESP flow health -- using reportlab (pure Python, no headless-browser
+dependency).
+"""
+import io
+from datetime import datetime
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+)
+
+SEVERITY_COLORS = {
+    "critical": colors.HexColor("#B91C1C"),
+    "warning": colors.HexColor("#B45309"),
+    "info": colors.HexColor("#1D4ED8"),
+}
+SEVERITY_HEX = {"critical": "#B91C1C", "warning": "#B45309", "info": "#1D4ED8"}
+
+
+def build_pdf_report(sessions, findings, score, esp_flows, source_name="capture.pcap") -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.8 * cm, bottomMargin=1.8 * cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleX", parent=styles["Title"], textColor=colors.HexColor("#0F172A"))
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], textColor=colors.HexColor("#0F172A"),
+                         spaceBefore=14, spaceAfter=6)
+    body = styles["BodyText"]
+    small = ParagraphStyle("small", parent=styles["BodyText"], fontSize=8.5, leading=11)
+
+    story = []
+    story.append(Paragraph("IPsec VPN Protocol Analyser", title_style))
+    story.append(Paragraph("Security Forensics & Cryptographic Audit Report", styles["Heading3"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(
+        f"<b>Source capture:</b> {source_name} &nbsp;&nbsp; "
+        f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", small))
+    story.append(Spacer(1, 14))
+
+    # --- Executive summary ---
+    story.append(Paragraph("Executive Summary", h2))
+    est = sum(1 for s in sessions if s.established)
+    story.append(Paragraph(
+        f"<b>{len(sessions)}</b> IPsec tunnel negotiation(s) identified &mdash; "
+        f"<b>{est}</b> established successfully, <b>{len(sessions) - est}</b> failed or incomplete. "
+        f"Cryptographic posture score: <b>{score['score']}/100 ({score['grade']})</b> "
+        f"based on {score['critical']} critical and {score['warning']} warning finding(s).",
+        body))
+    story.append(Spacer(1, 10))
+
+    # --- Sessions table ---
+    story.append(Paragraph("Tunnel Sessions", h2))
+    sess_data = [["#", "IKE Ver", "Peer A", "Peer B", "Messages", "Status"]]
+    for i, s in enumerate(sessions, 1):
+        sess_data.append([
+            str(i), s.ike_version, s.peer_a, s.peer_b, str(len(s.messages)),
+            "Established" if s.established else "Failed / Incomplete",
+        ])
+    t = Table(sess_data, colWidths=[1.2 * cm, 2 * cm, 3.6 * cm, 3.6 * cm, 2.3 * cm, 3.5 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F5F9")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 10))
+
+    # --- Findings ---
+    story.append(Paragraph("Security & Diagnostic Findings", h2))
+    if not findings:
+        story.append(Paragraph("No findings -- no weak algorithms or negotiation errors detected.", body))
+    for f in findings:
+        hexcolor = SEVERITY_HEX.get(f.severity, "#000000")
+        story.append(Paragraph(
+            f'<font color="{hexcolor}">'
+            f'<b>[{f.severity.upper()}]</b></font> {f.title} '
+            f'<i>(packet #{f.source_packet})</i>', small))
+        story.append(Paragraph(f.detail, small))
+        story.append(Spacer(1, 4))
+    story.append(Spacer(1, 8))
+
+    # --- ESP flow health ---
+    if esp_flows:
+        story.append(Paragraph("ESP Flow / Anti-Replay Analysis", h2))
+        esp_data = [["SPI", "Packets", "Out-of-order", "Gaps", "Max gap", "Replay suspects"]]
+        for spi, fl in esp_flows.items():
+            esp_data.append([spi, str(fl.packets_seen), str(fl.out_of_order),
+                              str(fl.gaps_detected), str(fl.max_gap), str(fl.replay_suspects)])
+        t2 = Table(esp_data, colWidths=[3.2 * cm, 2.2 * cm, 2.6 * cm, 1.8 * cm, 2 * cm, 3 * cm])
+        t2.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F5F9")]),
+        ]))
+        story.append(t2)
+
+    story.append(Spacer(1, 16))
+    story.append(Paragraph(
+        "Generated by IPsec VPN Protocol Analyser (hackathon prototype). "
+        "This report is a heuristic educational analysis and is not a substitute "
+        "for a formal cryptographic compliance audit.", small))
+
+    doc.build(story)
+    return buf.getvalue()
