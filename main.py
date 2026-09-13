@@ -440,10 +440,10 @@ DASHBOARD_TEMPLATE = """
             </div>
         </header>
 
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <h3>Tracked Handshakes</h3>
-                <div class="counter-value">{{ data.summary.total_handshakes }}</div>
+       if __name__ == '__main__':
+    logger.info("Initializing consolidated IPsec Framework server suite stack natively...")
+    # Bind to standard developmental testing configurations cleanly
+    app.run(host='0.0.0.0', port=5000, debug=True)
                 <div class="subtitle-tag">✓ Engine Monitoring Active</div>
             </div>
             <div class="metric-card">
