@@ -234,3 +234,4 @@ def generate_default_analysis_mockup() -> dict:
         "diagnostics": [
             "ERROR: IKE Notify NO_PROPOSAL_CHOSEN - Encryption algorithm mismatch",
             "WARNING: Weak DH Group detected (GROUP2-1024) - Upgrade to GROUP14+",
+"WARNING: IKEv1 Aggressive Mode detected - Vulnerable to PSK brute-force","INFO: ESP sequence counter validated - No packet loss detected"]}
