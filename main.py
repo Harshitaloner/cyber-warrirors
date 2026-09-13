@@ -32,8 +32,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("IPsecMonolithicEngine")
 
 app = Flask(__name__)
-UPLOAD_FOLDER = '/tmp/ipsec_uploads'
-OUTPUT_FOLDER = '/mnt/user-data/outputs'
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'ipsec_uploads')
+OUTPUT_FOLDER = os.path.join(os.getcwd(), 'outputs')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
